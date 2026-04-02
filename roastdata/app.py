@@ -2,9 +2,23 @@ import streamlit as st
 import pandas as pd
 from streamlit_gsheets import GSheetsConnection
 from datetime import datetime
+import requests
+from bs4 import BeautifulSoup
 
 st.set_page_config(page_title="焙煎記録アプリ", layout="wide")
 st.title("☕ ROASTING LOG & RECIPE")
+
+# ==========================================
+# URLからタイトルを取得する関数
+# ==========================================
+def fetch_bean_info(url):
+    try:
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        response = requests.get(url, headers=headers, timeout=5)
+        soup = BeautifulSoup(response.content, "html.parser")
+        return soup.title.string.strip() if soup.title else ""
+    except Exception:
+        return ""
 
 # ==========================================
 # 1. データベース接続と初期化
@@ -42,7 +56,7 @@ default_values = {
     "ORIGIN": "Brazil", "PROCESS": "Natural", "ROAST_LEVEL": "深煎", 
     "ROOM_TEMP": 20.0, "CHARGE_TEMP": 200, "BATCH_SIZE": 700, "ROASTED_WEIGHT": 0,
     "SOAK1_M": 0, "SOAK1_S": 30, "SOAK1_H": 40, "SOAK1_A": 1.0,
-    "SOAK2_M": 1, "SOAK2_S": 0, "SOAK2_H": 40, "SOAK2_A": 2.0,
+    "SOAK2_M": 1, "SOAK2_S": 0, "SOAK2_H": 100, "SOAK2_A": 3.5,  # ご要望通り変更
     "TP_M": 2, "TP_S": 0, "TP_TEMP": 110,
     "MAILLARD_M": 5, "MAILLARD_S": 0, "MAILLARD_TEMP": 150, "MAILLARD_H": 60, "MAILLARD_A": 3.5,
     "T190_M": 8, "T190_S": 0, "T190_H": 60, "T190_A": 4.5,
@@ -106,7 +120,6 @@ with tab1:
                     if key in row_data and pd.notna(row_data[key]):
                         st.session_state[key] = row_data[key]
                         
-                # 古いデータの互換性処理（自動マッピング）
                 if "SOAK_M" in row_data and pd.notna(row_data["SOAK_M"]):
                     st.session_state["SOAK2_M"] = row_data["SOAK_M"]
                     st.session_state["SOAK2_S"] = row_data["SOAK_S"]
@@ -128,6 +141,24 @@ with tab1:
                 st.rerun()
 
     st.header("1. 基本情報")
+    
+    # --- URL取得機能追加 ---
+    st.markdown("**🌐 生豆データの取得 (任意)**")
+    col_url1, col_url2 = st.columns([3, 1])
+    with col_url1:
+        url_input = st.text_input("問屋などのURLを入力", key="url_input_field", label_visibility="collapsed")
+    with col_url2:
+        if st.button("URLからORIGIN名を取得", use_container_width=True):
+            if url_input:
+                with st.spinner("情報を取得中..."):
+                    fetched_title = fetch_bean_info(url_input)
+                    if fetched_title:
+                        st.session_state["ORIGIN"] = fetched_title
+                        st.success("取得しました。")
+                    else:
+                        st.warning("取得に失敗しました。")
+    # -----------------------
+
     b_col1, b_col2, b_col3, b_col4 = st.columns(4)
     with b_col1:
         st.text_input("ORIGIN (産地)", key="ORIGIN")
@@ -155,14 +186,12 @@ with tab1:
         event_row("190℃ 到達", "T190", has_temp=False, has_control=True)
         event_row("1ハゼ", "CRACK1", has_temp=True, has_control=False)
         
-        # 190℃ + 1min の自動計算
         t190_sec = get_sec("T190")
         t190p1_sec = t190_sec + 60
         st.session_state["T190P1_M"] = t190p1_sec // 60
         st.session_state["T190P1_S"] = t190p1_sec % 60
         event_row("190℃ + 1min", "T190P1", has_temp=False, has_control=True, time_disabled=True)
         
-        # 2ハゼ（チェックボックス連動）
         st.markdown("---")
         no_crack2 = st.checkbox("2ハゼなし（到達しない）", value=not st.session_state["HAS_CRACK2"])
         st.session_state["HAS_CRACK2"] = not no_crack2
