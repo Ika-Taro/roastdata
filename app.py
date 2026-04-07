@@ -1,0 +1,304 @@
+import streamlit as st
+import pandas as pd
+from streamlit_gsheets import GSheetsConnection
+from datetime import datetime
+import requests
+from bs4 import BeautifulSoup
+
+st.set_page_config(page_title="焙煎記録アプリ", layout="wide")
+st.title("☕ ROASTING LOG & RECIPE")
+
+# ==========================================
+# URLからタイトルを取得する関数
+# ==========================================
+def fetch_bean_info(url):
+    try:
+        headers = {'User-Agent': 'Mozilla/5.0'}
+        response = requests.get(url, headers=headers, timeout=5)
+        soup = BeautifulSoup(response.content, "html.parser")
+        return soup.title.string.strip() if soup.title else ""
+    except Exception:
+        return ""
+
+# ==========================================
+# 1. データベース接続と初期化
+# ==========================================
+conn = st.connection("gsheets", type=GSheetsConnection)
+sheet_name = "RoastLogs"
+
+COLUMNS = [
+    "プロファイル名", "日付", "ORIGIN", "PROCESS", "ROAST_LEVEL", "ROOM_TEMP", "CHARGE_TEMP", 
+    "BATCH_SIZE", "ROASTED_WEIGHT", "LOSS_PCT",
+    "SOAK1_M", "SOAK1_S", "SOAK1_H", "SOAK1_A",
+    "SOAK2_M", "SOAK2_S", "SOAK2_H", "SOAK2_A",
+    "TP_M", "TP_S", "TP_TEMP",
+    "MAILLARD_M", "MAILLARD_S", "MAILLARD_TEMP", "MAILLARD_H", "MAILLARD_A",
+    "T190_M", "T190_S", "T190_H", "T190_A",
+    "CRACK1_M", "CRACK1_S", "CRACK1_TEMP",
+    "T190P1_M", "T190P1_S", "T190P1_H", "T190P1_A",
+    "PRE_CRACK2_M", "PRE_CRACK2_S", "PRE_CRACK2_H", "PRE_CRACK2_A", # 新規追加：2ハゼ前操作
+    "HAS_CRACK2", "CRACK2_M", "CRACK2_S",
+    "DISCHARGE_M", "DISCHARGE_S", "DISCHARGE_TEMP",
+    "DRY_PCT", "MAILLARD_PCT", "DEV_PCT", "MEMO"
+]
+
+try:
+    df_logs = conn.read(worksheet=sheet_name, ttl="10m")
+    if df_logs.empty or "プロファイル名" not in df_logs.columns:
+        df_logs = pd.DataFrame(columns=COLUMNS)
+    df_logs = df_logs.dropna(subset=["プロファイル名"])
+    # 過去データに新しいカラムがない場合の補完
+    for col in COLUMNS:
+        if col not in df_logs.columns:
+            df_logs[col] = ""
+except Exception:
+    df_logs = pd.DataFrame(columns=COLUMNS)
+
+# ==========================================
+# 2. セッションステート初期化
+# ==========================================
+default_values = {
+    "ORIGIN": "Brazil", "PROCESS": "Natural", "ROAST_LEVEL": "深煎", 
+    "ROOM_TEMP": 20.0, "CHARGE_TEMP": 200, "BATCH_SIZE": 700, "ROASTED_WEIGHT": 0,
+    "SOAK1_M": 0, "SOAK1_S": 30, "SOAK1_H": 40, "SOAK1_A": 1.0,
+    "SOAK2_M": 1, "SOAK2_S": 0, "SOAK2_H": 100, "SOAK2_A": 3.5,
+    "TP_M": 2, "TP_S": 0, "TP_TEMP": 110,
+    "MAILLARD_M": 5, "MAILLARD_S": 0, "MAILLARD_TEMP": 150, "MAILLARD_H": 60, "MAILLARD_A": 3.5,
+    "T190_M": 8, "T190_S": 0, "T190_H": 60, "T190_A": 4.5,
+    "CRACK1_M": 8, "CRACK1_S": 40, "CRACK1_TEMP": 195,
+    "T190P1_M": 9, "T190P1_S": 0, "T190P1_H": 50, "T190P1_A": 3.0,
+    "PRE_CRACK2_M": 11, "PRE_CRACK2_S": 0, "PRE_CRACK2_H": 55, "PRE_CRACK2_A": 5.0, # 初期値
+    "HAS_CRACK2": True,
+    "CRACK2_M": 12, "CRACK2_S": 0,
+    "DISCHARGE_M": 12, "DISCHARGE_S": 30, "DISCHARGE_TEMP": 230,
+    "MEMO": ""
+}
+
+for key, val in default_values.items():
+    if key not in st.session_state:
+        st.session_state[key] = val
+
+# ==========================================
+# 3. UIコンポーネント用関数
+# ==========================================
+def event_row(label, prefix, has_temp=False, has_control=True, time_disabled=False):
+    st.markdown(f"**{label}**")
+    cols = st.columns([1.5, 1.5, 1.5, 2, 2])
+    with cols[0]:
+        st.number_input("分", min_value=0, max_value=59, key=f"{prefix}_M", step=1, disabled=time_disabled)
+    with cols[1]:
+        st.number_input("秒", min_value=0, max_value=59, key=f"{prefix}_S", step=1, disabled=time_disabled)
+    with cols[2]:
+        if has_temp:
+            st.number_input("温度(℃)", key=f"{prefix}_TEMP", step=1)
+    with cols[3]:
+        if has_control:
+            st.slider("Heat(火力)", 0, 100, key=f"{prefix}_H", step=5)
+    with cols[4]:
+        if has_control:
+            st.slider("Air(排気)", 0.0, 8.0, key=f"{prefix}_A", step=0.5)
+    st.markdown("---")
+
+def get_sec(prefix):
+    return st.session_state[f"{prefix}_M"] * 60 + st.session_state[f"{prefix}_S"]
+
+def safe_get(row, key, default=""):
+    val = row.get(key)
+    return val if pd.notna(val) else default
+
+# ==========================================
+# 4. メイン画面レイアウト
+# ==========================================
+tab1, tab2, tab3 = st.tabs(["🔥 焙煎の記録・実行", "📂 過去データの直接編集", "📤 AI評価用出力・CSV"])
+
+with tab1:
+    st.success("💡 **過去のレシピを呼び出す**")
+    col_load1, col_load2 = st.columns([3, 1])
+    with col_load1:
+        recipe_list = ["（新規・または現在の設定のまま）"] + df_logs["プロファイル名"].tolist()
+        selected_recipe = st.selectbox("ベースにするプロファイルを選択", recipe_list)
+    with col_load2:
+        st.write("") 
+        if st.button("設定を読み込む", use_container_width=True):
+            if selected_recipe != "（新規・または現在の設定のまま）":
+                row_data = df_logs[df_logs["プロファイル名"] == selected_recipe].iloc[0]
+                for key in default_values.keys():
+                    if key in row_data and pd.notna(row_data[key]) and row_data[key] != "":
+                        try:
+                            st.session_state[key] = type(default_values[key])(row_data[key])
+                        except ValueError:
+                            st.session_state[key] = row_data[key]
+                st.rerun()
+
+    st.header("1. 基本情報")
+    st.markdown("**🌐 生豆データの取得 (任意)**")
+    col_url1, col_url2 = st.columns([3, 1])
+    with col_url1:
+        url_input = st.text_input("問屋などのURLを入力", key="url_input_field", label_visibility="collapsed")
+    with col_url2:
+        if st.button("URLからORIGIN名を取得", use_container_width=True):
+            if url_input:
+                with st.spinner("情報を取得中..."):
+                    fetched_title = fetch_bean_info(url_input)
+                    if fetched_title:
+                        st.session_state["ORIGIN"] = fetched_title
+                        st.success("取得しました。")
+                    else:
+                        st.warning("取得に失敗しました。")
+
+    b_col1, b_col2, b_col3, b_col4 = st.columns(4)
+    with b_col1:
+        st.text_input("ORIGIN (産地)", key="ORIGIN")
+        st.number_input("ROOM TEMP (室温)", key="ROOM_TEMP", step=0.5)
+    with b_col2:
+        st.selectbox("PROCESS (精製)", ["Washed", "Natural", "Honey", "Anaerobic", "Others"], key="PROCESS")
+        st.number_input("CHARGE (投入温度)", key="CHARGE_TEMP", step=1)
+    with b_col3:
+        st.selectbox("ROAST LEVEL", ["浅煎", "中煎", "中深煎", "深煎"], key="ROAST_LEVEL")
+        st.number_input("BATCH SIZE (投入量 g)", key="BATCH_SIZE", step=10)
+    with b_col4:
+        st.write("") 
+        st.number_input("ROASTED (焙煎後重量 g)", key="ROASTED_WEIGHT", step=1)
+        batch = st.session_state["BATCH_SIZE"]
+        roasted = st.session_state["ROASTED_WEIGHT"]
+        loss_pct = ((batch - roasted) / batch * 100) if batch > 0 and roasted > 0 else 0
+        st.metric("LOSS (目減り率)", f"{loss_pct:.1f}%")
+
+    st.header("2. タイムライン & 操作ログ")
+    with st.container():
+        event_row("ソーキング", "SOAK1", has_temp=False, has_control=True)
+        event_row("ソーキング終了", "SOAK2", has_temp=False, has_control=True)
+        event_row("中点 (TP)", "TP", has_temp=True, has_control=False)
+        event_row("メイラード開始", "MAILLARD", has_temp=True, has_control=True)
+        event_row("190℃ 到達", "T190", has_temp=False, has_control=True)
+        event_row("1ハゼ", "CRACK1", has_temp=True, has_control=False)
+        
+        t190_sec = get_sec("T190")
+        t190p1_sec = t190_sec + 60
+        st.session_state["T190P1_M"] = t190p1_sec // 60
+        st.session_state["T190P1_S"] = t190p1_sec % 60
+        event_row("190℃ + 1min", "T190P1", has_temp=False, has_control=True, time_disabled=True)
+        
+        st.markdown("---")
+        no_crack2 = st.checkbox("2ハゼなし（浅煎〜中深煎など）", value=not st.session_state["HAS_CRACK2"])
+        st.session_state["HAS_CRACK2"] = not no_crack2
+        if not no_crack2:
+            event_row("2ハゼ前操作 (火力・排気調整)", "PRE_CRACK2", has_temp=False, has_control=True)
+            event_row("2ハゼ", "CRACK2", has_temp=False, has_control=False)
+        
+        event_row("排出 (DISCHARGE)", "DISCHARGE", has_temp=True, has_control=False)
+
+    st.header("3. プロファイル分析 & 保存")
+    t_maillard_sec = get_sec("MAILLARD")
+    t_crack_sec = get_sec("CRACK1")
+    t_end_sec = get_sec("DISCHARGE")
+    
+    total_sec = t_end_sec if t_end_sec > 0 else 1
+    dry_pct = (t_maillard_sec / total_sec) * 100 if t_maillard_sec > 0 else 0
+    maillard_sec = t_crack_sec - t_maillard_sec
+    maillard_pct = (maillard_sec / total_sec) * 100 if maillard_sec > 0 else 0
+    dev_sec = t_end_sec - t_crack_sec
+    dev_pct = (dev_sec / total_sec) * 100 if dev_sec > 0 else 0
+
+    a_col1, a_col2, a_col3, a_col4 = st.columns(4)
+    a_col1.metric("TOTAL TIME", f"{int(t_end_sec//60):02d}:{int(t_end_sec%60):02d}")
+    a_col2.metric("DRY (%)", f"{dry_pct:.1f}%")
+    a_col3.metric("MAILLARD (%)", f"{maillard_pct:.1f}%")
+    a_col4.metric("DEV/DTR (%)", f"{dev_pct:.1f}%")
+
+    st.text_area("MEMO (特記事項・カッピング評価など)", key="MEMO")
+
+    if st.button("💾 この焙煎記録をスプレッドシートに保存する", use_container_width=True):
+        # 時刻を含めることで同一日の同豆でも名前が重複しないようにする
+        current_time = datetime.now().strftime("%Y/%m/%d %H:%M")
+        profile_name = f"[{current_time}] {st.session_state['ORIGIN']} ({st.session_state['ROAST_LEVEL']})"
+        
+        save_data = {"プロファイル名": profile_name, "日付": datetime.now().strftime("%Y/%m/%d"), "LOSS_PCT": round(loss_pct, 1), 
+                     "DRY_PCT": round(dry_pct, 1), "MAILLARD_PCT": round(maillard_pct, 1), "DEV_PCT": round(dev_pct, 1)}
+        for key in default_values.keys():
+            save_data[key] = st.session_state[key]
+            
+        new_df = pd.DataFrame([save_data])
+        updated_df = pd.concat([df_logs, new_df], ignore_index=True)
+        try:
+            conn.update(worksheet=sheet_name, data=updated_df)
+            st.cache_data.clear()
+            st.success(f"「{profile_name}」を保存しました！")
+        except Exception as e:
+            st.error(f"保存エラー: {e}")
+
+with tab2:
+    st.header("📋 スプレッドシートの直接編集・削除")
+    st.warning("⚠️ 表のセルをダブルクリックして直接編集できます。行の左端をクリックして「Delete」キーを押すと削除できます。変更後は必ず下のボタンを押してください。")
+    
+    if df_logs.empty:
+        st.info("データがありません。")
+    else:
+        # 全データを編集可能にする
+        edited_df = st.data_editor(
+            df_logs, 
+            num_rows="dynamic", # 行の追加・削除を許可
+            use_container_width=True,
+            key="data_editor_logs"
+        )
+        if st.button("🔄 変更をスプレッドシートに反映する", type="primary"):
+            try:
+                conn.update(worksheet=sheet_name, data=edited_df)
+                st.cache_data.clear()
+                st.success("スプレッドシートを更新しました！")
+                st.rerun()
+            except Exception as e:
+                st.error(f"更新エラー: {e}")
+
+with tab3:
+    st.header("AI焙煎師への評価依頼用データ")
+    eval_recipe = st.selectbox("出力するプロファイルを選択", [""] + df_logs["プロファイル名"].tolist(), key="eval_select")
+    
+    if eval_recipe != "":
+        row = df_logs[df_logs["プロファイル名"] == eval_recipe].iloc[0]
+        
+        crack2_text = ""
+        if safe_get(row, 'HAS_CRACK2', True):
+            crack2_text = f"・2ハゼ前操作: {int(safe_get(row, 'PRE_CRACK2_M', 0)):02d}:{int(safe_get(row, 'PRE_CRACK2_S', 0)):02d} | Heat: {safe_get(row, 'PRE_CRACK2_H', '-')} | Air: {safe_get(row, 'PRE_CRACK2_A', '-')}\n・2ハゼ: {int(safe_get(row, 'CRACK2_M', 0)):02d}:{int(safe_get(row, 'CRACK2_S', 0)):02d}\n"
+        
+        report_text = f"""【焙煎記録プロフェッショナルレポート】
+プロファイル名: {safe_get(row, 'プロファイル名')}
+ORIGIN: {safe_get(row, 'ORIGIN')}
+PROCESS: {safe_get(row, 'PROCESS')}
+ROAST_LEVEL: {safe_get(row, 'ROAST_LEVEL')}
+ROOM_TEMP: {safe_get(row, 'ROOM_TEMP')}℃
+BATCH_SIZE: {safe_get(row, 'BATCH_SIZE')}g
+ROASTED_WEIGHT: {safe_get(row, 'ROASTED_WEIGHT')}g
+LOSS_PCT: {safe_get(row, 'LOSS_PCT')}%
+CHARGE_TEMP: {safe_get(row, 'CHARGE_TEMP')}℃
+
+[TIMELINE / DTR]
+DRY: {safe_get(row, 'DRY_PCT')}%
+MAILLARD: {safe_get(row, 'MAILLARD_PCT')}%
+DEV (DTR): {safe_get(row, 'DEV_PCT')}%
+
+[OPERATION LOG]
+・ソーキング: {int(safe_get(row, 'SOAK1_M', 0)):02d}:{int(safe_get(row, 'SOAK1_S', 0)):02d} | Heat: {safe_get(row, 'SOAK1_H', '-')} | Air: {safe_get(row, 'SOAK1_A', '-')}
+・ソーキング終了: {int(safe_get(row, 'SOAK2_M', 0)):02d}:{int(safe_get(row, 'SOAK2_S', 0)):02d} | Heat: {safe_get(row, 'SOAK2_H', '-')} | Air: {safe_get(row, 'SOAK2_A', '-')}
+・中点(TP): {int(safe_get(row, 'TP_M', 0)):02d}:{int(safe_get(row, 'TP_S', 0)):02d} @ {safe_get(row, 'TP_TEMP', '-')}℃
+・メイラード開始: {int(safe_get(row, 'MAILLARD_M', 0)):02d}:{int(safe_get(row, 'MAILLARD_S', 0)):02d} @ {safe_get(row, 'MAILLARD_TEMP', '-')}℃ | Heat: {safe_get(row, 'MAILLARD_H', '-')} | Air: {safe_get(row, 'MAILLARD_A', '-')}
+・190℃到達: {int(safe_get(row, 'T190_M', 0)):02d}:{int(safe_get(row, 'T190_S', 0)):02d} | Heat: {safe_get(row, 'T190_H', '-')} | Air: {safe_get(row, 'T190_A', '-')}
+・1ハゼ: {int(safe_get(row, 'CRACK1_M', 0)):02d}:{int(safe_get(row, 'CRACK1_S', 0)):02d} @ {safe_get(row, 'CRACK1_TEMP', '-')}℃
+・190℃+1min: {int(safe_get(row, 'T190P1_M', 0)):02d}:{int(safe_get(row, 'T190P1_S', 0)):02d} | Heat: {safe_get(row, 'T190P1_H', '-')} | Air: {safe_get(row, 'T190P1_A', '-')}
+{crack2_text}・排出: {int(safe_get(row, 'DISCHARGE_M', 0)):02d}:{int(safe_get(row, 'DISCHARGE_S', 0)):02d} @ {safe_get(row, 'DISCHARGE_TEMP', '-')}℃
+
+MEMO: {safe_get(row, 'MEMO')}
+"""
+        st.code(report_text, language="markdown")
+
+    st.markdown("---")
+    st.header("全データのCSVエクスポート")
+    if not df_logs.empty:
+        csv = df_logs.to_csv(index=False).encode('utf-8-sig')
+        st.download_button(
+            label="📥 全焙煎ログをCSVでダウンロード",
+            data=csv,
+            file_name=f"roast_logs_{datetime.now().strftime('%Y%m%d')}.csv",
+            mime="text/csv",
+            use_container_width=True
+        )
